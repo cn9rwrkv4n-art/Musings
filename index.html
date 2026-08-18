@@ -1,0 +1,497 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Baseball Musings Hit Streak CSV Collector v2</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: max(20px, env(safe-area-inset-top)) 18px max(20px, env(safe-area-inset-bottom));
+      background: #f2f2f7;
+      color: #1c1c1e;
+    }
+    .card {
+      max-width: 760px;
+      margin: 0 auto;
+      background: #fff;
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: 0 8px 28px rgba(0,0,0,.09);
+    }
+    h1 { margin: 0 0 10px; font-size: 25px; }
+    p { line-height: 1.45; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin: 18px 0;
+    }
+    label { font-weight: 650; font-size: 14px; }
+    input {
+      box-sizing: border-box;
+      width: 90%;
+      display: block;
+      margin: 7px auto 0;
+      padding: 12px;
+      font: inherit;
+      font-size: 17px;
+      border: 1px solid #c7c7cc;
+      border-radius: 11px;
+      background: #fff;
+      color: #1c1c1e;
+    }
+    button {
+      width: 100%;
+      border: 0;
+      border-radius: 12px;
+      padding: 14px;
+      font-size: 17px;
+      font-weight: 750;
+      background: #007aff;
+      color: white;
+    }
+    button:disabled { opacity: .45; }
+
+    /* v2.2: Compact button row with a smaller Cancel button. */
+    .button-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: center;
+    }
+
+    #cancelButton {
+      width: auto;
+      padding: 14px 18px;
+      background: #8e8e93;
+    }
+
+    /* v2.4: iOS requires the final file save to come from a real user tap. */
+    #saveButton {
+      margin-top: 10px;
+      background: #34c759;
+    }
+
+    progress { width: 100%; height: 18px; margin-top: 16px; }
+    #status {
+      margin-top: 15px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      font-variant-numeric: tabular-nums;
+    }
+    .note { font-size: 14px; color: #636366; }
+    @media (max-width: 580px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    @media (prefers-color-scheme: dark) {
+      body { background: #000; color: #f2f2f7; }
+      .card { background: #1c1c1e; }
+      input { background: #2c2c2e; color: #fff; border-color: #48484a; }
+      .note { color: #aeaeb2; }
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>Hit Streak CSV Collector v2</h1>
+
+    <p class="note">
+      Runs in Safari on iPad. It keeps every daily occurrence and preserves only
+      the website’s original 13 columns.
+    </p>
+
+    <p class="note">
+      <a href="https://www.baseballmusings.com/cgi-bin/CurStreak.py?" target="_blank">Visit</a>
+    </p>
+
+    <div class="grid">
+      <label>
+        Start date
+        <input id="startDate" type="date" value="2026-03-25">
+      </label>
+
+      <label>
+        End date
+        <input id="endDate" type="date">
+      </label>
+    </div>
+
+    <div class="button-row">
+      <button id="runButton">Create CSV</button>
+      <button id="cancelButton" disabled>Cancel</button>
+    </div>
+    <button id="saveButton" hidden>Save CSV</button>
+    <progress id="progress" value="0" max="1" hidden></progress>
+    <div id="status">Ready.</div>
+  </main>
+
+<script>
+/*
+  BASELINE v1 remains unchanged.
+  CHECKPOINT v2 fixes the parser.
+
+  The first version expected space-separated text. Jina converts the website's
+  HTML table into a Markdown pipe table, so v2 parses Markdown tables directly.
+  It also includes raw-HTML and loose-text fallbacks.
+*/
+
+const HEADERS = [
+  "Player", "Games", "At Bats", "Runs", "Hits", "HR", "RBI",
+  "BB", "K", "BA", "OBA", "Slug%", "Last Game Date"
+];
+
+const runButton = document.getElementById("runButton");
+const cancelButton = document.getElementById("cancelButton");
+const saveButton = document.getElementById("saveButton");
+const progress = document.getElementById("progress");
+const statusBox = document.getElementById("status");
+
+/*
+  CHECKPOINT v2.2
+  Cancel immediately stops the active request and prevents any partial CSV
+  from being created.
+*/
+let cancelRequested = false;
+let activeController = null;
+let pendingCsvUrl = null;
+let pendingCsvName = null;
+
+
+runButton.addEventListener("click", collectSeason);
+
+cancelButton.addEventListener("click", () => {
+  cancelRequested = true;
+  cancelButton.disabled = true;
+
+  // Abort the page currently being downloaded, if one is active.
+  if (activeController) {
+    activeController.abort();
+  }
+
+  statusBox.textContent = "Stopping…";
+});
+
+saveButton.addEventListener("click", () => {
+  if (!pendingCsvUrl || !pendingCsvName) return;
+
+  /*
+    On iPhone/iPad Safari, a download triggered after a long async operation can
+    be blocked because it is no longer tied to the original Create CSV tap.
+    This second, real user tap reliably opens/saves the finished CSV.
+  */
+  const link = document.createElement("a");
+  link.href = pendingCsvUrl;
+  link.download = pendingCsvName;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+});
+
+// Default End Date = yesterday.
+{
+  const yesterday = new Date();
+  yesterday.setHours(12,0,0,0);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const y = yesterday.getFullYear();
+  const m = String(yesterday.getMonth()+1).padStart(2,"0");
+  const d = String(yesterday.getDate()).padStart(2,"0");
+  document.getElementById("endDate").value = `${y}-${m}-${d}`;
+}
+
+
+function localDate(value) {
+  const [y, m, d] = value.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function nextDay(date) {
+  const copy = new Date(date);
+  copy.setDate(copy.getDate() + 1);
+  return copy;
+}
+
+function siteDate(date) {
+  return [
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+    date.getFullYear()
+  ].join("/");
+}
+
+function cleanMarkdownCell(value) {
+  let text = String(value ?? "").trim();
+
+  // Convert [Player Name](URL) to Player Name.
+  const linkMatch = text.match(/^\[([^\]]+)\]\([^)]+\)$/);
+  if (linkMatch) text = linkMatch[1];
+
+  return text
+    .replace(/\\\|/g, "|")
+    .replace(/&amp;/g, "&")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .trim();
+}
+
+function parseMarkdownTable(text) {
+  const rows = [];
+  const lines = text.split(/\r?\n/);
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line.startsWith("|") || !line.endsWith("|")) continue;
+
+    const cells = line
+      .slice(1, -1)
+      .split("|")
+      .map(cleanMarkdownCell);
+
+    if (cells.length !== 13) continue;
+
+    // Skip the header and Markdown separator rows.
+    if (cells[0] === "Player") continue;
+    if (cells.every(cell => /^:?-{3,}:?$/.test(cell))) continue;
+
+    // Real rows always end in YYYY-MM-DD.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(cells[12])) continue;
+
+    rows.push(cells);
+  }
+
+  return rows;
+}
+
+function parseRawHtml(text) {
+  const rows = [];
+
+  // This fallback is used if a proxy returns raw HTML instead of Markdown.
+  const doc = new DOMParser().parseFromString(text, "text/html");
+  const table = doc.querySelector("table.dbd");
+  if (!table) return rows;
+
+  for (const tr of table.querySelectorAll("tr")) {
+    const cells = [...tr.querySelectorAll("td")].map(td =>
+      td.textContent.replace(/\s+/g, " ").trim()
+    );
+
+    if (cells.length === 13 && /^\d{4}-\d{2}-\d{2}$/.test(cells[12])) {
+      rows.push(cells);
+    }
+  }
+
+  return rows;
+}
+
+function parseLooseText(text) {
+  const rows = [];
+
+  /*
+    Last-resort parser for a plain-text response:
+    Player Name 14 60 18 26 7 14 2 17 .433 .469 .867 2026-08-02
+  */
+  const pattern =
+    /^(?:\[[^\]]+\]\([^)]+\)\s*)?(.+?)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d*\.\d+|\d+)\s+(\d*\.\d+|\d+)\s+(\d*\.\d+|\d+)\s+(\d{4}-\d{2}-\d{2})\s*$/;
+
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw
+      .replace(/^\s*[-*]\s*/, "")
+      .replace(/\*\*/g, "")
+      .trim();
+
+    const m = line.match(pattern);
+    if (!m) continue;
+    rows.push(m.slice(1, 14).map(cleanMarkdownCell));
+  }
+
+  return rows;
+}
+
+function parsePage(text) {
+  const markdownRows = parseMarkdownTable(text);
+  if (markdownRows.length) return markdownRows;
+
+  const htmlRows = parseRawHtml(text);
+  if (htmlRows.length) return htmlRows;
+
+  return parseLooseText(text);
+}
+
+async function downloadPage(date, signal) {
+  const formatted = siteDate(date);
+  const source =
+    "http://www.baseballmusings.com/cgi-bin/CurStreak.py?EndDate=" +
+    encodeURIComponent(formatted);
+
+  // Jina provides a CORS-enabled text version of the public webpage.
+  const proxy = "https://r.jina.ai/" + source;
+
+  const response = await fetch(proxy, {
+    cache: "no-store",
+    signal
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  return response.text();
+}
+
+function csvEscape(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text)
+    ? `"${text.replaceAll('"', '""')}"`
+    : text;
+}
+
+function saveCsv(rows, startDate, endDate) {
+  const lines = [
+    HEADERS.map(csvEscape).join(","),
+    ...rows.map(row => row.map(csvEscape).join(","))
+  ];
+
+  // UTF-8 BOM improves compatibility with Apple Numbers.
+  const blob = new Blob(["\uFEFF" + lines.join("\r\n")], {
+    type: "text/csv;charset=utf-8"
+  });
+
+  const start = startDate.toISOString().slice(0, 10);
+  const end = endDate.toISOString().slice(0, 10);
+
+  // Revoke any older prepared file before replacing it.
+  if (pendingCsvUrl) {
+    URL.revokeObjectURL(pendingCsvUrl);
+  }
+
+  pendingCsvUrl = URL.createObjectURL(blob);
+  pendingCsvName = `Baseball_Musings_Hit_Streaks_${start}_to_${end}.csv`;
+
+  // iOS-safe: show a real button that the user taps to save the finished file.
+  saveButton.hidden = false;
+}
+async function collectSeason() {
+  const startValue = document.getElementById("startDate").value;
+  const endValue = document.getElementById("endDate").value;
+
+  if (!startValue || !endValue) {
+    statusBox.textContent = "Choose both dates.";
+    return;
+  }
+
+  const start = localDate(startValue);
+  const end = localDate(endValue);
+
+  if (start > end) {
+    statusBox.textContent = "The start date must be before the end date.";
+    return;
+  }
+
+  const dates = [];
+  for (let d = start; d <= end; d = nextDay(d)) {
+    dates.push(new Date(d));
+  }
+
+  cancelRequested = false;
+  activeController = null;
+
+  if (pendingCsvUrl) {
+    URL.revokeObjectURL(pendingCsvUrl);
+    pendingCsvUrl = null;
+    pendingCsvName = null;
+  }
+  saveButton.hidden = true;
+
+  runButton.disabled = true;
+  cancelButton.disabled = false;
+  progress.hidden = false;
+  progress.max = dates.length;
+  progress.value = 0;
+
+  const allRows = [];
+  const failures = [];
+  const emptyDates = [];
+
+  try {
+    for (let i = 0; i < dates.length; i++) {
+      const date = dates[i];
+      const formatted = siteDate(date);
+
+      statusBox.textContent =
+        `Reading ${formatted}\n` +
+        `${i + 1} of ${dates.length} dates\n` +
+        `${allRows.length.toLocaleString()} rows collected`;
+
+      if (cancelRequested) break;
+
+      try {
+        activeController = new AbortController();
+        const text = await downloadPage(date, activeController.signal);
+        activeController = null;
+
+        if (cancelRequested) break;
+
+        const rows = parsePage(text);
+
+        if (rows.length) {
+          allRows.push(...rows);
+        } else {
+          emptyDates.push(formatted);
+        }
+      } catch (error) {
+        activeController = null;
+
+        if (cancelRequested || error.name === "AbortError") {
+          break;
+        }
+
+        console.error(formatted, error);
+        failures.push(`${formatted} (${error.message})`);
+      }
+
+      progress.value = i + 1;
+
+      if (cancelRequested) break;
+
+      // Pause between requests so the public services are not hammered.
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+
+    if (cancelRequested) {
+      statusBox.textContent = "Ready.";
+      progress.hidden = true;
+      progress.value = 0;
+      saveButton.hidden = true;
+      return;
+    }
+
+    if (!allRows.length) {
+      throw new Error(
+        "No rows were found. Safari may be blocking the proxy, or the website response changed."
+      );
+    }
+
+    saveCsv(allRows, start, end);
+
+    statusBox.textContent =
+      `Finished — tap Save CSV.\n` +
+      `${allRows.length.toLocaleString()} total rows\n` +
+      `${dates.length - failures.length} dates reached` +
+      (emptyDates.length
+        ? `\n${emptyDates.length} dates had no qualifying streak rows`
+        : "") +
+      (failures.length
+        ? `\n\nFailed dates:\n${failures.join("\n")}`
+        : "");
+  } catch (error) {
+    statusBox.textContent = `Stopped: ${error.message}`;
+  } finally {
+    activeController = null;
+    runButton.disabled = false;
+    cancelButton.disabled = true;
+  }
+}
+</script>
+</body>
+</html>
